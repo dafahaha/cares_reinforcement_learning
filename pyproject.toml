@@ -25,6 +25,7 @@ dependencies = [
   "pandas==2.2.2",
   "natsort==8.4.0",
   "pytest==7.4.2",
+  "reportlab==5.0.0",
   # keep truly runtime-only deps here
 ]
 
@@ -52,4 +53,5 @@ include = ["cares_reinforcement_learning*"]
 
 [project.scripts]
 cares-rl = "cares_reinforcement_learning.run:main_with_runner"
-cares-rl-plot = "cares_reinforcement_learning.plotter:main"
+cares-rl-plot = "cares_reinforcement_learning.reporting.plotting.run:main"
+cares-rl-stats = "cares_reinforcement_learning.reporting.analysis.run:main"
