@@ -7,6 +7,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 
 import matplotlib
+from matplotlib.lines import Line2D
 
 matplotlib.use("Agg")
 
@@ -16,6 +17,7 @@ import pandas as pd
 from matplotlib.artist import Artist
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter
 
 import cares_reinforcement_learning.reporting.analysis.metrics as analysis_metrics
 from cares_reinforcement_learning.reporting.models import PlotRun, PlotTask
@@ -144,29 +146,75 @@ def _aggregate_run_series(
     return summary, tuple(seed_frame_list)
 
 
+def _humanise_metric_name(value: str) -> str:
+    cleaned = re.sub(
+        r"^(training|evaluation|train|eval)[\s:_-]+",
+        "",
+        value.strip(),
+        flags=re.IGNORECASE,
+    )
+    cleaned = cleaned.replace("episode_reward", "reward")
+    cleaned = cleaned.replace("_", " ").replace("-", " ")
+    return " ".join(cleaned.split()).title()
+
+
 def _panel_title(panel: PanelSpec) -> str:
     if panel.title:
-        return panel.title
-    metric_names = ", ".join(series.label or series.column for series in panel.series)
-    return f"{panel.source.title()}: {metric_names}"
+        return _humanise_metric_name(panel.title)
+    metric_names = ", ".join(
+        _humanise_metric_name(series.label or series.column) for series in panel.series
+    )
+    return metric_names
 
 
 def _series_label(run: PlotRun, panel: PanelSpec, series: SeriesSpec) -> str:
-    if len(panel.series) == 1:
+    primary_count = sum(item.axis == "primary" for item in panel.series)
+    secondary_count = sum(item.axis == "secondary" for item in panel.series)
+
+    # Keep legends focused on run/comparison names. Only append metric names
+    # when multiple series share one axis and need disambiguation.
+    if primary_count <= 1 and secondary_count <= 1:
         return run.name
+
+    axis_count = primary_count if series.axis == "primary" else secondary_count
+    if axis_count <= 1:
+        return run.name
+
     return f"{run.name} — {series.label or series.column}"
 
 
-def _grid_shape(spec: FigureSpec) -> tuple[int, int]:
-    count = len(spec.panels)
-    if spec.rows is not None and spec.columns is not None:
-        return spec.rows, spec.columns
-    if spec.rows is not None:
-        return spec.rows, math.ceil(count / spec.rows)
-    if spec.columns is not None:
-        return math.ceil(count / spec.columns), spec.columns
-    columns = min(2, count)
-    return math.ceil(count / columns), columns
+def _grid_shape(
+    count: int,
+    *,
+    rows: int | None,
+    columns: int | None,
+    max_columns: int = 3,
+) -> tuple[int, int]:
+    """Resolve a subplot grid for a given number of plotted items."""
+    if count < 1:
+        raise ValueError("At least one item is required to create a subplot grid.")
+
+    if rows is not None and rows < 1:
+        raise ValueError("rows must be positive when supplied.")
+
+    if columns is not None and columns < 1:
+        raise ValueError("columns must be positive when supplied.")
+
+    if rows is not None and columns is not None:
+        if rows * columns < count:
+            raise ValueError(
+                "rows x columns is smaller than the number of items to plot."
+            )
+        return rows, columns
+
+    if rows is not None:
+        return rows, math.ceil(count / rows)
+
+    if columns is not None:
+        return math.ceil(count / columns), columns
+
+    resolved_columns = min(max_columns, count)
+    return math.ceil(count / resolved_columns), resolved_columns
 
 
 def _color_cycle(size: int) -> list[str]:
@@ -189,6 +237,10 @@ def _draw_series(
     show_seeds: bool,
     show_mean: bool,
     show_std: bool,
+    mean_linewidth: float,
+    seed_linewidth: float,
+    seed_alpha: float,
+    std_alpha: float,
 ) -> None:
     if show_seeds:
         for _, seed_frame in seed_frames:
@@ -197,8 +249,8 @@ def _draw_series(
                 seed_frame[series.column],
                 color=color,
                 linestyle=linestyle,
-                linewidth=0.8,
-                alpha=0.18,
+                linewidth=seed_linewidth,
+                alpha=seed_alpha,
             )
 
     if show_mean:
@@ -207,7 +259,7 @@ def _draw_series(
             aggregate["mean"],
             color=color,
             linestyle=linestyle,
-            linewidth=1.8,
+            linewidth=mean_linewidth,
             label=label,
         )
 
@@ -219,26 +271,60 @@ def _draw_series(
                 aggregate.loc[valid, "mean"] - aggregate.loc[valid, "std"],
                 aggregate.loc[valid, "mean"] + aggregate.loc[valid, "std"],
                 color=color,
-                alpha=0.16,
+                alpha=std_alpha,
                 linewidth=0,
             )
+
+
+def _superscript_exponent(exponent: int) -> str:
+    translation = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+    return str(exponent).translate(translation)
+
+
+def _configure_compact_step_axis(axis: Axes, panel: PanelSpec) -> None:
+    """Move large step scaling into the x-axis label instead of offset text."""
+    if panel.x_scale != "linear":
+        return
+
+    x_min, x_max = axis.get_xlim()
+    magnitude = max(abs(x_min), abs(x_max))
+    if magnitude < 1_000:
+        return
+
+    exponent = int(math.floor(math.log10(magnitude) / 3) * 3)
+    scale = 10.0**exponent
+    base_label = panel.x_label or panel.x
+
+    axis.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value / scale:g}"))
+    axis.xaxis.offsetText.set_visible(False)
+    axis.set_xlabel(
+        f"{base_label} (×10{_superscript_exponent(exponent)})",
+        fontsize=axis.xaxis.label.get_fontsize(),
+    )
 
 
 def _configure_panel_axes(
     axis: Axes,
     panel: PanelSpec,
     *,
-    ticks_fontsize: int,
-    label_fontsize: int,
-    title_fontsize: int,
+    spec: FigureSpec,
+    show_title: bool,
 ) -> None:
-    axis.set_title(_panel_title(panel), fontsize=title_fontsize)
-    axis.set_xlabel(panel.x_label or panel.x, fontsize=label_fontsize)
-    axis.set_ylabel(panel.y_label or panel.series[0].column, fontsize=label_fontsize)
+    if show_title:
+        axis.set_title(_panel_title(panel), fontsize=spec.style.title_fontsize, pad=3)
+    axis.set_xlabel(panel.x_label or panel.x, fontsize=spec.style.label_fontsize)
+    axis.set_ylabel(
+        panel.y_label or panel.series[0].column,
+        fontsize=spec.style.label_fontsize,
+    )
     axis.set_xscale(panel.x_scale)
     axis.set_yscale(panel.y_scale)
-    axis.tick_params(axis="both", labelsize=ticks_fontsize)
-    axis.grid(True, alpha=0.25)
+    axis.tick_params(axis="both", labelsize=spec.style.ticks_fontsize)
+    axis.grid(True, alpha=spec.style.grid_alpha)
+    if spec.style.compact_step_axis:
+        _configure_compact_step_axis(axis, panel)
+    if spec.style.axes_box_aspect is not None:
+        axis.set_box_aspect(spec.style.axes_box_aspect)
 
 
 def _combined_legend_entries(
@@ -246,22 +332,21 @@ def _combined_legend_entries(
     secondary_axis: Axes | None,
     panel: PanelSpec,
     *,
-    ticks_fontsize: int,
-    label_fontsize: int,
-) -> tuple[list[Artist], list[str]]:
-    handles, labels = axis.get_legend_handles_labels()
+    spec: FigureSpec,
+) -> tuple[tuple[list[Artist], list[str]], tuple[list[Artist], list[str]]]:
+    primary_handles, primary_labels = axis.get_legend_handles_labels()
     if secondary_axis is None:
-        return handles, labels
+        return (primary_handles, primary_labels), ([], [])
 
     secondary_axis.set_ylabel(
         panel.secondary_y_label
         or next(series.column for series in panel.series if series.axis == "secondary"),
-        fontsize=label_fontsize,
+        fontsize=spec.style.label_fontsize,
     )
     secondary_axis.set_yscale(panel.secondary_y_scale)
-    secondary_axis.tick_params(axis="y", labelsize=ticks_fontsize)
-    handles_two, labels_two = secondary_axis.get_legend_handles_labels()
-    return handles + handles_two, labels + labels_two
+    secondary_axis.tick_params(axis="y", labelsize=spec.style.ticks_fontsize)
+    secondary_handles, secondary_labels = secondary_axis.get_legend_handles_labels()
+    return (primary_handles, primary_labels), (secondary_handles, secondary_labels)
 
 
 def _remove_unused_axes(axes: np.ndarray, used_count: int) -> None:
@@ -269,52 +354,43 @@ def _remove_unused_axes(axes: np.ndarray, used_count: int) -> None:
         unused_axis.remove()
 
 
-def _unique_legend_entries(axes: np.ndarray) -> tuple[list[Artist], list[str]]:
-    handles: list[Artist] = []
-    labels: list[str] = []
-    for axis in axes.flat:
-        axis_handles, axis_labels = axis.get_legend_handles_labels()
-        for handle, label in zip(axis_handles, axis_labels, strict=True):
-            if label not in labels:
-                handles.append(handle)
-                labels.append(label)
-    return handles, labels
+def _merge_legend_entries(
+    target_handles: list[Artist],
+    target_labels: list[str],
+    handles: Sequence[Artist],
+    labels: Sequence[str],
+) -> None:
+    for handle, label in zip(handles, labels, strict=True):
+        if label not in target_labels:
+            target_handles.append(handle)
+            target_labels.append(label)
 
 
 def _plot_panel(
     axis: Axes,
     task: PlotTask,
+    spec: FigureSpec,
     panel: PanelSpec,
     *,
-    train_window_size: int,
-    train_bin_size: float | None,
-    show_seeds: bool,
-    show_mean: bool,
-    show_std: bool,
-    ticks_fontsize: int,
-    label_fontsize: int,
-    title_fontsize: int,
-    legend_fontsize: int,
     show_legend: bool = True,
     color_by_comparison: Mapping[str, str] | None = None,
-) -> None:
+    show_panel_title: bool = True,
+) -> tuple[tuple[list[Artist], list[str]], tuple[list[Artist], list[str]]]:
     """Render one panel including optional secondary axis and legend entries."""
     _validate_panel(task, panel)
     secondary_axis: Axes | None = None
     if any(series.axis == "secondary" for series in panel.series):
         secondary_axis = axis.twinx()
 
+    cycle = _color_cycle(len(task.runs))
+
     if color_by_comparison is None:
-        cycle = _color_cycle(len(task.runs))
         color_by_comparison = {
             run.name: cycle[index % len(cycle)] for index, run in enumerate(task.runs)
         }
 
     for run_index, run in enumerate(task.runs):
-        color = color_by_comparison.get(run.name)
-        if color is None:
-            cycle = _color_cycle(len(task.runs))
-            color = cycle[run_index % len(cycle)]
+        color = color_by_comparison.get(run.name, cycle[run_index % len(cycle)])
         for series_index, series in enumerate(panel.series):
             target_axis = secondary_axis if series.axis == "secondary" else axis
             if target_axis is None:
@@ -324,8 +400,8 @@ def _plot_panel(
                 run,
                 panel,
                 series,
-                train_window_size=train_window_size,
-                train_bin_size=train_bin_size,
+                train_window_size=spec.train_window_size,
+                train_bin_size=spec.train_bin_size,
             )
             linestyle = series.linestyle or _LINESTYLES[series_index % len(_LINESTYLES)]
             label = _series_label(run, panel, series)
@@ -338,90 +414,361 @@ def _plot_panel(
                 color=color,
                 linestyle=linestyle,
                 label=label,
-                show_seeds=show_seeds,
-                show_mean=show_mean,
-                show_std=show_std,
+                show_seeds=spec.show_seeds,
+                show_mean=spec.show_mean,
+                show_std=spec.show_std,
+                mean_linewidth=spec.style.mean_linewidth,
+                seed_linewidth=spec.style.seed_linewidth,
+                seed_alpha=spec.style.seed_alpha,
+                std_alpha=spec.style.std_alpha,
             )
 
     _configure_panel_axes(
         axis,
         panel,
-        ticks_fontsize=ticks_fontsize,
-        label_fontsize=label_fontsize,
-        title_fontsize=title_fontsize,
+        spec=spec,
+        show_title=show_panel_title,
     )
-    handles, labels = _combined_legend_entries(
+    primary_entries, secondary_entries = _combined_legend_entries(
         axis,
         secondary_axis,
         panel,
-        ticks_fontsize=ticks_fontsize,
-        label_fontsize=label_fontsize,
+        spec=spec,
     )
+    primary_handles, primary_labels = primary_entries
+    secondary_handles, secondary_labels = secondary_entries
+    handles = primary_handles + secondary_handles
+    labels = primary_labels + secondary_labels
 
     if handles and show_legend:
         axis.legend(
             handles,
             labels,
             loc="best",
-            fontsize=legend_fontsize,
+            fontsize=spec.style.legend_fontsize,
         )
+    return primary_entries, secondary_entries
+
+
+def _axis_legend_title(
+    panel: PanelSpec,
+    axis_name: str,
+) -> str | None:
+    axis_series = tuple(series for series in panel.series if series.axis == axis_name)
+    if len(axis_series) != 1:
+        return None
+
+    if axis_name == "primary" and panel.y_label:
+        return panel.y_label
+
+    if axis_name == "secondary" and panel.secondary_y_label:
+        return panel.secondary_y_label
+
+    series = axis_series[0]
+    return _humanise_metric_name(series.label or series.column)
+
+
+def _shared_axis_legend_title(
+    panels: Sequence[PanelSpec],
+    axis_name: str,
+) -> str | None:
+    titles = {
+        title
+        for panel in panels
+        if (title := _axis_legend_title(panel, axis_name)) is not None
+    }
+    if len(titles) != 1:
+        return None
+
+    return next(iter(titles))
+
+
+def _draw_shared_legends(
+    figure: Figure,
+    spec: FigureSpec,
+    *,
+    primary_handles: Sequence[Artist],
+    primary_labels: Sequence[str],
+    secondary_handles: Sequence[Artist],
+    secondary_labels: Sequence[str],
+    primary_title: str | None = None,
+    secondary_title: str | None = None,
+) -> int:
+    def _draw_row(
+        handles: Sequence[Artist],
+        labels: Sequence[str],
+        *,
+        title: str | None,
+        y: float,
+    ) -> None:
+        row_handles: list[Artist] = list(handles)
+        row_labels = list(labels)
+
+        if title:
+            # Invisible handle for the inline row title only.
+            title_handle = Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker="",
+                color="none",
+            )
+            row_handles.insert(0, title_handle)
+            row_labels.insert(0, f"{title}:")
+
+        legend = figure.legend(
+            row_handles,
+            row_labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, y),
+            ncol=max(1, len(row_labels)),
+            frameon=False,
+            fontsize=spec.style.legend_fontsize,
+            handlelength=1.5,
+            handletextpad=0.4,
+            columnspacing=1.2,
+        )
+
+        # Collapse only the dummy title handle's allocated width.
+        if title:
+            legend.legend_handles[0].set_visible(False)
+
+    row_count = 0
+    has_primary = bool(primary_handles)
+    has_secondary = bool(secondary_handles)
+    base_y = spec.style.legend_y
+    row_step = spec.style.legend_row_step
+
+    if has_primary and has_secondary:
+        _draw_row(
+            primary_handles,
+            primary_labels,
+            title=primary_title,
+            y=base_y + row_step,
+        )
+        _draw_row(
+            secondary_handles,
+            secondary_labels,
+            title=secondary_title,
+            y=base_y,
+        )
+        return 2
+
+    if has_primary:
+        _draw_row(
+            primary_handles,
+            primary_labels,
+            title=primary_title,
+            y=base_y,
+        )
+        row_count += 1
+
+    if has_secondary:
+        _draw_row(
+            secondary_handles,
+            secondary_labels,
+            title=secondary_title,
+            y=base_y,
+        )
+        row_count += 1
+
+    return row_count
+
+
+def _legend_bottom_margin(
+    spec: FigureSpec,
+    row_count: int,
+) -> float:
+    if row_count <= 0:
+        return 0.0
+
+    return min(
+        0.45,
+        spec.style.legend_bottom + spec.style.legend_margin_per_row * (row_count - 1),
+    )
+
+
+def _share_repeated_axis_labels(
+    axes: np.ndarray,
+    *,
+    used_count: int,
+    rows: int,
+    columns: int,
+) -> None:
+    """Show repeated x labels only on the bottom row and y labels on the first column."""
+    used_axes = list(axes.flat)[:used_count]
+    if len(used_axes) < 2:
+        return
+
+    x_labels = {axis.get_xlabel() for axis in used_axes}
+    y_labels = {axis.get_ylabel() for axis in used_axes}
+    shared_x = len(x_labels) == 1
+    shared_y = len(y_labels) == 1
+
+    for index, axis in enumerate(used_axes):
+        row, column = divmod(index, columns)
+        if shared_x and row < rows - 1:
+            axis.set_xlabel("")
+        if shared_y and column > 0:
+            axis.set_ylabel("")
+
+
+def _render_subplot_grid(
+    *,
+    spec: FigureSpec,
+    rows: int,
+    columns: int,
+    plot_items: Sequence[tuple[PlotTask, PanelSpec, bool]],
+    grid_title: str | None,
+    color_by_comparison: Mapping[str, str],
+    use_shared_legend: bool,
+    primary_legend_title: str | None,
+    secondary_legend_title: str | None,
+    sharex: bool = False,
+    sharey: bool = False,
+) -> Figure:
+    """Render a configured collection of task/panel pairs into one subplot grid."""
+    item_count = len(plot_items)
+    if item_count < 1:
+        raise ValueError("At least one plot item is required.")
+
+    figure_width, figure_height = _figure_size(spec, rows=rows)
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(figure_width, figure_height),
+        squeeze=False,
+        sharex=sharex,
+        sharey=sharey,
+    )
+
+    primary_shared_handles: list[Artist] = []
+    primary_shared_labels: list[str] = []
+    secondary_shared_handles: list[Artist] = []
+    secondary_shared_labels: list[str] = []
+
+    for (task, panel, show_panel_title), axis in zip(
+        plot_items,
+        axes.flat,
+        strict=False,
+    ):
+        primary_entries, secondary_entries = _plot_panel(
+            axis,
+            task,
+            spec,
+            panel,
+            show_legend=not use_shared_legend,
+            color_by_comparison=color_by_comparison,
+            show_panel_title=show_panel_title,
+        )
+
+        if not use_shared_legend:
+            continue
+
+        primary_handles, primary_labels = primary_entries
+        secondary_handles, secondary_labels = secondary_entries
+
+        _merge_legend_entries(
+            primary_shared_handles,
+            primary_shared_labels,
+            primary_handles,
+            primary_labels,
+        )
+        _merge_legend_entries(
+            secondary_shared_handles,
+            secondary_shared_labels,
+            secondary_handles,
+            secondary_labels,
+        )
+
+    _remove_unused_axes(axes, item_count)
+
+    _share_repeated_axis_labels(
+        axes,
+        used_count=item_count,
+        rows=rows,
+        columns=columns,
+    )
+
+    legend_rows = 0
+    if use_shared_legend:
+        legend_rows = _draw_shared_legends(
+            figure,
+            spec,
+            primary_handles=primary_shared_handles,
+            primary_labels=primary_shared_labels,
+            secondary_handles=secondary_shared_handles,
+            secondary_labels=secondary_shared_labels,
+            primary_title=primary_legend_title,
+            secondary_title=secondary_legend_title,
+        )
+
+    if grid_title:
+        figure.suptitle(
+            grid_title,
+            fontsize=spec.style.title_fontsize + 2,
+            y=spec.style.title_y,
+        )
+
+    bottom = _legend_bottom_margin(spec, legend_rows)
+    top = spec.style.top_rect if grid_title else 1.0
+
+    figure.tight_layout(
+        rect=(0.0, bottom, 1.0, top),
+        pad=spec.style.layout_pad,
+        w_pad=spec.style.layout_w_pad,
+        h_pad=spec.style.layout_h_pad,
+    )
+
+    return figure
 
 
 def render_task(
     task: PlotTask,
     spec: FigureSpec,
-    *,
-    train_window_size: int = 20,
-    train_bin_size: float | None = None,
-    show_seeds: bool = False,
-    show_mean: bool = True,
-    show_std: bool = True,
 ) -> Figure:
     """Render one figure for a single task."""
-    rows, columns = _grid_shape(spec)
-    colors = _comparison_colors((task,))
-    figure, axes = plt.subplots(
-        rows,
-        columns,
-        figsize=(spec.width, spec.height * rows),
-        squeeze=False,
+    rows, columns = _grid_shape(
+        len(spec.panels),
+        rows=spec.rows,
+        columns=spec.columns,
     )
 
-    for panel, axis in zip(spec.panels, axes.flat):
-        _plot_panel(
-            axis,
+    multiple_panels = len(spec.panels) > 1
+
+    plot_items = tuple(
+        (
             task,
             panel,
-            train_window_size=train_window_size,
-            train_bin_size=train_bin_size,
-            show_seeds=show_seeds,
-            show_mean=show_mean,
-            show_std=show_std,
-            ticks_fontsize=spec.ticks_fontsize,
-            label_fontsize=spec.label_fontsize,
-            title_fontsize=spec.title_fontsize,
-            legend_fontsize=spec.legend_fontsize,
-            show_legend=True,
-            color_by_comparison=colors,
+            multiple_panels and spec.show_panel_titles,
         )
+        for panel in spec.panels
+    )
 
-    _remove_unused_axes(axes, len(spec.panels))
+    return _render_subplot_grid(
+        spec=spec,
+        rows=rows,
+        columns=columns,
+        plot_items=plot_items,
+        grid_title=spec.title or task.name,
+        color_by_comparison=_comparison_colors((task,)),
+        use_shared_legend=multiple_panels,
+        primary_legend_title=(
+            _shared_axis_legend_title(spec.panels, "primary")
+            if multiple_panels
+            else None
+        ),
+        secondary_legend_title=(
+            _shared_axis_legend_title(spec.panels, "secondary")
+            if multiple_panels
+            else None
+        ),
+    )
 
-    figure.suptitle(spec.title or task.name, fontsize=spec.title_fontsize + 2)
-    figure.tight_layout()
-    return figure
 
-
-def _tasks_grid_shape(task_count: int, columns: int | None) -> tuple[int, int]:
-    if task_count < 1:
-        raise ValueError("At least one task is required for a combined task figure.")
-    if columns is not None:
-        if columns < 1:
-            raise ValueError("columns must be positive when supplied.")
-        resolved_columns = min(columns, task_count)
-    else:
-        resolved_columns = min(4, math.ceil(math.sqrt(task_count)))
-    return math.ceil(task_count / resolved_columns), resolved_columns
+def _figure_size(spec: FigureSpec, *, rows: int) -> tuple[float, float]:
+    """Resolve fixed figure width with row-scaled total height."""
+    return spec.style.figure_width, spec.style.row_height * rows
 
 
 def _comparison_colors(tasks: Sequence[PlotTask]) -> dict[str, str]:
@@ -436,82 +783,44 @@ def _comparison_colors(tasks: Sequence[PlotTask]) -> dict[str, str]:
 def render_tasks(
     tasks: Sequence[PlotTask],
     *,
-    plot: PanelSpec,
-    title: str | None = None,
-    columns: int | None = None,
-    panel_width: float = 3.2,
-    panel_height: float = 2.45,
-    train_window_size: int = 20,
-    train_bin_size: float | None = None,
-    show_seeds: bool = False,
-    show_mean: bool = True,
-    show_std: bool = True,
-    label_fontsize: int = 9,
-    title_fontsize: int = 10,
-    ticks_fontsize: int = 8,
-    legend_fontsize: int = 9,
+    spec: FigureSpec,
 ) -> Figure:
     """Render one plot across several tasks, with one subplot per task."""
     ordered_tasks = tuple(tasks)
-    rows, resolved_columns = _tasks_grid_shape(len(ordered_tasks), columns)
-    figure, axes = plt.subplots(
-        rows,
-        resolved_columns,
-        figsize=(panel_width * resolved_columns, panel_height * rows),
-        squeeze=False,
+
+    if len(spec.panels) != 1:
+        raise ValueError("Combined task figures must contain exactly one panel.")
+
+    rows, columns = _grid_shape(
+        len(ordered_tasks),
+        rows=spec.rows,
+        columns=spec.columns,
+    )
+
+    panel = spec.panels[0]
+
+    plot_items = tuple(
+        (
+            task,
+            dataclasses.replace(panel, title=task.name),
+            True,
+        )
+        for task in ordered_tasks
+    )
+
+    return _render_subplot_grid(
+        spec=spec,
+        rows=rows,
+        columns=columns,
+        plot_items=plot_items,
+        grid_title=spec.title,
+        color_by_comparison=_comparison_colors(ordered_tasks),
+        use_shared_legend=True,
+        primary_legend_title=_axis_legend_title(panel, "primary"),
+        secondary_legend_title=_axis_legend_title(panel, "secondary"),
         sharex=False,
         sharey=False,
     )
-    colors = _comparison_colors(ordered_tasks)
-
-    for task, axis in zip(ordered_tasks, axes.flat, strict=False):
-        task_plot = dataclasses.replace(plot, title=task.name)
-        _plot_panel(
-            axis,
-            task,
-            task_plot,
-            train_window_size=train_window_size,
-            train_bin_size=train_bin_size,
-            show_seeds=show_seeds,
-            show_mean=show_mean,
-            show_std=show_std,
-            ticks_fontsize=ticks_fontsize,
-            label_fontsize=label_fontsize,
-            title_fontsize=title_fontsize,
-            legend_fontsize=legend_fontsize,
-            show_legend=False,
-            color_by_comparison=colors,
-        )
-
-    _remove_unused_axes(axes, len(ordered_tasks))
-
-    handles, labels = _unique_legend_entries(axes)
-
-    if handles:
-        figure.legend(
-            handles,
-            labels,
-            loc="lower center",
-            bbox_to_anchor=(0.5, 0.01),
-            ncol=min(len(labels), max(1, resolved_columns)),
-            frameon=False,
-            fontsize=legend_fontsize,
-        )
-
-    figure.suptitle(
-        title or _panel_title(plot),
-        fontsize=title_fontsize + 1,
-        y=0.995,
-    )
-    legend_rows = math.ceil(max(1, len(labels)) / max(1, resolved_columns))
-    bottom = min(0.30, 0.09 + 0.035 * legend_rows)
-    figure.tight_layout(
-        rect=(0.0, bottom, 1.0, 0.96),
-        pad=0.6,
-        w_pad=0.7,
-        h_pad=0.8,
-    )
-    return figure
 
 
 def _safe_filename(value: str) -> str:
