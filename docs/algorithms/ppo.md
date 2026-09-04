@@ -6,21 +6,26 @@ Proximal Policy Optimization (PPO) is an on-policy policy gradient algorithm tha
 
 **Paper**: [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347) (Schulman et al., 2017)
 
-**Action Space**: Discrete and Continuous
+**Action Space**: Continuous (bounded to $[-1, 1]$)
 
 **Policy Type**: On-policy, policy gradient
 
+!!! note "Implementation detail"
+    In this library, PPO is implemented for **bounded continuous control**. The actor is a Gaussian policy in pre-squash space that is passed through a $\tanh$ squashing function, so actions lie in $[-1, 1]$. Log-probabilities include the correct change-of-variables correction for the $\tanh$ transformation. When using a Gymnasium-style environment, wrap actions so that the environment preserves this $[-1, 1]$ convention.
+
 ## How It Works
 
-PPO learns a stochastic policy $\pi_\theta(a|s)$ that directly maps states to action probabilities. The key innovation is the clipped surrogate objective, which prevents excessively large policy updates that can destabilize training.
+PPO learns a stochastic policy $\pi_\theta(a|s)$ that directly maps states to action distributions. The key innovation is the clipped surrogate objective, which prevents excessively large policy updates that can destabilize training.
 
 ### Key Components
 
-1. **Actor Network**: Outputs action probabilities (discrete) or mean and std of a Gaussian distribution (continuous).
+1. **Actor Network**: Outputs the mean of a Gaussian distribution; the per-action standard deviations are maintained by a learnable `log_std` parameter optimized jointly with the actor.
 
 2. **Critic Network**: Estimates the state-value function $V(s)$ for advantage estimation.
 
 3. **Generalized Advantage Estimation (GAE)**: Computes advantage estimates by balancing bias and variance through a parameter $\lambda$.
+
+4. **Rollout Buffer**: Collects on-policy experience (squashed actions, corrected log-probabilities and critic values) and is flushed after each policy update.
 
 ### Clipped Surrogate Objective
 
@@ -32,261 +37,243 @@ $$
 
 Where:
 - $r_t(\theta) = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{old}}(a_t|s_t)}$: Probability ratio
-- $A_t$: Advantage estimate
-- $\epsilon$: Clip parameter (typically 0.1 or 0.2)
+- $A_t$: Advantage estimate (GAE)
+- $\epsilon$: Clip parameter (`eps_clip`, typically 0.2)
 
 The clipping ensures the policy update does not deviate too far from the old policy, improving training stability.
 
-### Value Function Loss
+### Update Procedure
 
-The critic is updated to minimize the value function loss:
-
-$$
-L^{VF}(\theta) = \mathbb{E}_t \left[ (V_\theta(s_t) - V_t^{target})^2 \right]
-$$
-
-### Entropy Bonus
-
-An entropy bonus is added to encourage exploration:
-
-$$
-L^{S}(\theta) = \mathbb{E}_t [H(\pi_\theta(\cdot|s_t))]
-$$
-
-### Total Objective
-
-$$
-L(\theta) = L^{CLIP} - c_1 L^{VF} + c_2 L^{S}
-$$
-
-Where $c_1$ and $c_2$ are coefficients for value loss and entropy bonus.
+- Rollout collection is strictly on-policy using the current stochastic policy.
+- Advantages are computed with GAE; returns for the critic are `advantage + value`.
+- Advantages are normalized across the batch for numerical stability.
+- Updates are performed over multiple epochs of minibatch SGD (`updates_per_iteration`).
+- Gradient norm clipping is applied to both actor and critic (`max_grad_norm`).
+- An optional entropy bonus encourages exploration (`entropy_start` / `entropy_end`, decayed by a linear scheduler over `entropy_decay` steps).
+- If `target_kl` is set, minibatch/epoch updates stop early once the approximated KL exceeds the threshold.
 
 ## Configuration
+
+The PPO configuration is provided by the `PPOConfig` class in [`cares_reinforcement_learning/algorithm/configurations.py`](https://github.com/UoA-CARES/cares_reinforcement_learning/blob/main/cares_reinforcement_learning/algorithm/configurations.py).
 
 ### Algorithm Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `learning_rate` | float | 3e-4 | Learning rate for actor and critic optimizers |
+| `actor_lr` | float | 3e-4 | Learning rate for the actor optimizer |
+| `critic_lr` | float | 1e-3 | Learning rate for the critic optimizer |
 | `gamma` | float | 0.99 | Discount factor for future rewards |
-| `gae_lambda` | float | 0.95 | GAE lambda parameter for advantage estimation |
-| `clip_coef` | float | 0.2 | PPO clipping parameter ($\epsilon$) |
-| `ent_coef` | float | 0.01 | Entropy bonus coefficient |
-| `vf_coef` | float | 0.5 | Value function loss coefficient |
-| `max_grad_norm` | float | 0.5 | Maximum gradient norm for clipping |
-| `n_epochs` | int | 10 | Number of optimization epochs per rollout |
-| `num_minibatches` | int | 4 | Number of minibatches per epoch |
-| `clip_vloss` | bool | True | Whether to clip value function loss |
-| `norm_adv` | bool | True | Whether to normalize advantages |
+| `eps_clip` | float | 0.2 | PPO clipping parameter ($\epsilon$) |
+| `gae_lambda` | float | 0.95 | GAE lambda for advantage estimation |
+| `max_grad_norm` | float \| None | 0.5 | Maximum gradient norm for clipping |
+| `updates_per_iteration` | int | 10 | Optimization epochs per rollout |
+| `minibatch_size` | int | 1000 | Minibatch size per gradient step |
+| `number_steps_per_train_policy` | int | 10000 | Rollout steps collected per policy update |
+| `target_kl` | float \| None | None | Early-stopping KL threshold (disabled by default) |
 
-### Rollout Parameters
+### Exploration Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `rollout_length` | int | 2048 | Number of steps per rollout collection |
-| `total_timesteps` | int | 1e6 | Total training timesteps |
+| `entropy_start` | float | 0.0 | Initial entropy bonus coefficient |
+| `entropy_end` | float | 0.0 | Final entropy bonus coefficient |
+| `entropy_decay` | int | 0 | Steps over which the entropy coefficient decays |
+| `log_std_bounds` | list[float] | [-5.0, -0.5] | Bounds on the learnable log standard deviation |
+
+### Value Normalization
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `use_value_normalisation` | int | 0 | Enable running value normalization for the critic |
 
 ### Network Configuration
 
-See [MLP Configuration](../user_guide/mlp_configuration.md) for network architecture settings.
+The actor and critic architectures are configured through `actor_config` and `critic_config` (both `MLPConfig`). See [MLP Configuration](../user_guide/mlp_configuration.md) for how to specify layer types and activation functions.
 
-## Usage Example
+## Running PPO
+
+### With the Command-Line Interface (recommended)
+
+The library is configuration-driven. The quickest way to train a PPO agent is through the `cares-rl` CLI:
+
+```bash
+# Train PPO on Pendulum-v1 (continuous control) with default hyperparameters
+cares-rl train cli --gym openai --task Pendulum-v1 PPO
+
+# Override hyperparameters directly from the command line
+cares-rl train cli --gym openai --task Pendulum-v1 PPO --actor_lr 3e-4 --critic_lr 1e-3 --eps_clip 0.2
+
+# Train with full reproducibility via configuration files
+cares-rl train config --data_path ~/my_experiment/
+```
+
+For more details on the `cares-rl` CLI and configuration files, see the [Experiments guide](../user_guide/experiment.md).
+
+### Programmatic Usage
+
+Algorithms are created through the [`AlgorithmFactory`](https://github.com/UoA-CARES/cares_reinforcement_learning/blob/main/cares_reinforcement_learning/algorithm/algorithm_factory.py) and memories through the [`MemoryFactory`](https://github.com/UoA-CARES/cares_reinforcement_learning/blob/main/cares_reinforcement_learning/memory/memory_factory.py). Because PPO is on-policy, the rollout buffer is flushed once per policy update:
 
 ```python
-from cares_reinforcement_learning.algorithm.policy import PPO
-from cares_reinforcement_learning.algorithm.configurations import AlgorithmConfig
-from cares_reinforcement_learning.networks import MLPNetwork
+import numpy as np
 
-# Configure the algorithm
-config = AlgorithmConfig(
-    learning_rate=3e-4,
-    gamma=0.99,
-    gae_lambda=0.95,
-    clip_coef=0.2,
-    ent_coef=0.01,
-    vf_coef=0.5,
-    n_epochs=10,
-    num_minibatches=4,
-)
+from cares_reinforcement_learning.algorithm.algorithm_factory import AlgorithmFactory
+from cares_reinforcement_learning.algorithm.configurations import PPOConfig
+from cares_reinforcement_learning.memory.memory_factory import MemoryFactory
+from cares_reinforcement_learning.types.episode import EpisodeContext
+from cares_reinforcement_learning.types.experience import SingleAgentExperience
+from cares_reinforcement_learning.types.observation import SARLObservation
 
-# Create actor and critic networks
-actor_network = MLPNetwork(
-    observation_size=env.observation_space.shape[0],
-    action_size=env.action_space.shape[0],
-    output_activation="tanh",  # for continuous actions
-)
+# 1. Configure the algorithm
+config = PPOConfig(actor_lr=3e-4, critic_lr=1e-3)
 
-critic_network = MLPNetwork(
-    observation_size=env.observation_space.shape[0],
-    action_size=1,  # value output
-)
-
-# Initialize PPO
-algorithm = PPO(
-    actor_network=actor_network,
-    critic_network=critic_network,
+# 2. Build the agent and rollout buffer from the config
+factory = AlgorithmFactory()
+agent = factory.create_network(
+    observation_size={"image": None, "vector": observation_size},  # int obs dim
+    action_num=action_num,  # continuous action dimension
     config=config,
-    device="cuda",
 )
 
-# Training loop
+memory_buffer = MemoryFactory().create_memory(config)
+
+# 3. Collect an on-policy rollout and update
+observation = SARLObservation(vector_state=env.reset())
+
 for update in range(num_updates):
     # Collect rollout
-    for step in range(config.rollout_length):
-        action, log_prob, value = algorithm.act(observation)
-        next_observation, reward, done, info = env.step(action)
-        
-        rollout_buffer.add(observation, action, reward, done, log_prob, value)
+    for step in range(config.number_steps_per_train_policy):
+        action_sample = agent.act(observation)
+        action = action_sample.action
+        log_prob = action_sample.extras["log_prob"]
+        value = action_sample.extras["value"]
+
+        next_obs, reward, done, truncated, _ = env.step(action)
+        next_observation = SARLObservation(vector_state=next_obs)
+
+        experience = SingleAgentExperience(
+            observation=observation,
+            next_observation=next_observation,
+            action=action,
+            reward=float(reward),
+            done=bool(done),
+            truncated=bool(truncated),
+            train_data={"log_prob": log_prob, "value": value},
+            info={},
+        )
+        memory_buffer.add(experience)
         observation = next_observation
-    
-    # Compute returns and advantages
-    rollout_buffer.compute_returns_and_advantages(
-        last_value=algorithm.get_value(observation),
-        gamma=config.gamma,
-        gae_lambda=config.gae_lambda,
+
+    # On-policy update: flush the rollout buffer
+    episode_context = EpisodeContext(
+        training_step=update,
+        episode=update,
+        episode_steps=config.number_steps_per_train_policy,
+        episode_reward=0.0,
+        episode_done=False,
     )
-    
-    # Update policy
-    metrics = algorithm.train(rollout_buffer, episode_context)
+    metrics = agent.train(memory_buffer, episode_context)
 ```
+
+Note: `agent.act()` returns an [`ActionSample`](https://github.com/UoA-CARES/cares_reinforcement_learning/blob/main/cares_reinforcement_learning/types/action.py). The action is available at `action_sample.action`, and the on-policy quantities needed for training (`log_prob`, `value`) are returned in `action_sample.extras`.
 
 ## Stability Metrics
 
-Monitor the following metrics to assess PPO training stability:
+`agent.train()` returns a dictionary of metrics. Monitor the following to assess PPO training stability:
 
 ### Policy Metrics
 
 | Metric | Expected Behavior | Warning Signs |
 |--------|------------------|---------------|
-| `policy_loss` | Negative, gradually approaches 0 | Becomes positive (policy worse than old), large magnitude |
-| `approx_kl` | Small (< 0.01-0.02), stable | Exceeds 0.05 consistently (too large updates) |
-| `clip_fraction` | 0.05-0.3, stable | Near 0 (no clipping, lr too low) or > 0.5 (too aggressive) |
-| `entropy` | Gradually decreases, stabilizes | Drops to near 0 too quickly (premature convergence) |
+| `actor_loss` | Negative, gradually approaches 0 | Becomes positive (policy worse than old), large magnitude |
+| `approx_kl` | Small and stable | Consistently exceeds ~0.05 (updates too large) |
+| `clip_frac` | 0.05–0.3, stable | Near 0 (no clipping) or consistently > 0.5 (too aggressive) |
+| `entropy` | Stable, does not collapse too early | Drops to near 0 too quickly (premature convergence) |
+| `log_std_mean` | Converges within `log_std_bounds` | Hitting bounds (exploration collapse or runaway noise) |
 
 ### Value Metrics
 
 | Metric | Expected Behavior | Warning Signs |
 |--------|------------------|---------------|
-| `value_loss` | Decreases then stabilizes | Continuous growth, NaN |
-| `explained_variance` | Increases toward 1.0 | Negative (critic worse than mean prediction) |
-| `values_mean` | Tracks cumulative reward | Diverges from actual returns |
+| `critic_loss` | Decreases then stabilizes | Continuous growth, NaN |
 
 ### Performance Metrics
 
 | Metric | Expected Behavior | Warning Signs |
 |--------|------------------|---------------|
-| `episode_return` | Improves over time | No improvement after 100+ updates |
+| `episode_return` | Improves over time | No improvement after many updates |
 | `evaluation_return` | Smoother improvement | Consistently below baseline |
 
 ## Common Issues and Solutions
 
 ### 1. Policy Collapse / Premature Convergence
 
-**Symptom**: Entropy drops to near 0, policy becomes deterministic, performance plateaus at suboptimal level.
+**Symptom**: `entropy` drops to near 0, policy becomes deterministic, performance plateaus at a suboptimal level.
 
 **Causes**:
-- Entropy coefficient too low
+- `entropy_start` too low
 - Learning rate too high
-- Too many optimization epochs per rollout
+- Too many epochs per rollout
 
 **Solutions**:
-- Increase `ent_coef` to 0.02-0.05
-- Reduce learning rate to 1e-4 or 5e-5
-- Reduce `n_epochs` to 4-8
-- Increase `clip_coef` to 0.3 for more permissive updates
+- Increase `entropy_start` (and set `entropy_decay` for a scheduled decay)
+- Reduce `actor_lr` to 1e-4 or 5e-5
+- Reduce `updates_per_iteration` to 4–8
 
 ### 2. Large KL Divergence
 
-**Symptom**: `approx_kl` consistently exceeds 0.05, training unstable.
+**Symptom**: `approx_kl` consistently exceeds ~0.05, training unstable.
 
 **Causes**:
 - Learning rate too high
 - Too many epochs per rollout
-- Rollout length too short
+- Rollout too short (high variance)
 
 **Solutions**:
 - Reduce learning rate by 50%
-- Reduce `n_epochs` to 5-8
-- Increase `rollout_length` to 4096
-- Enable early stopping based on KL threshold
+- Reduce `updates_per_iteration` to 5–8
+- Increase `number_steps_per_train_policy`
+- Set `target_kl` (e.g. 0.02) to enable early stopping
 
 ### 3. Value Function Divergence
 
-**Symptom**: `value_loss` grows, `explained_variance` becomes negative.
+**Symptom**: `critic_loss` grows, values diverge from actual returns.
 
 **Causes**:
-- Value learning rate too high
+- Critic learning rate too high
 - Reward scale too large
-- Missing value clipping
 
 **Solutions**:
-- Use separate, lower learning rate for critic
-- Normalize or clip rewards
-- Enable `clip_vloss`
-- Reduce `vf_coef` to 0.25
+- Reduce `critic_lr`
+- Normalize or scale rewards
+- Enable `use_value_normalisation`
 
 ### 4. No Learning Progress
 
 **Symptom**: Episode return stays at baseline after many updates.
 
 **Causes**:
-- Rollout length too short for the task
+- Rollout too short for the task
 - Learning rate too low
 - Network architecture too simple
-- Advantage normalization issues
 
 **Solutions**:
-- Increase `rollout_length` to 4096 or 8192
+- Increase `number_steps_per_train_policy`
 - Increase learning rate to 5e-4 or 1e-3
-- Try larger network (256 or 512 hidden units, 2-3 layers)
-- Verify `norm_adv` is enabled
-
-## Hyperparameter Tuning Guide
-
-### Start Here (Default Configuration)
-
-```python
-config = AlgorithmConfig(
-    learning_rate=3e-4,
-    gamma=0.99,
-    gae_lambda=0.95,
-    clip_coef=0.2,
-    ent_coef=0.01,
-    vf_coef=0.5,
-    n_epochs=10,
-    num_minibatches=4,
-    rollout_length=2048,
-)
-```
-
-### If Training is Unstable:
-- Reduce `learning_rate` to 1e-4
-- Reduce `n_epochs` to 5
-- Reduce `clip_coef` to 0.1
-
-### If Learning is Too Slow:
-- Increase `learning_rate` to 5e-4
-- Increase `n_epochs` to 15-20
-- Increase `rollout_length` to 4096
-
-### For Sparse Reward Environments:
-- Increase `ent_coef` to 0.05-0.1
-- Use larger `rollout_length` (4096+)
-- Consider reward shaping or curriculum learning
+- Enlarge the `actor_config` / `critic_config` MLPs
 
 ## Comparison with Other Algorithms
 
 | Aspect | PPO | DQN | SAC | TD3 |
 |--------|-----|-----|-----|-----|
 | Policy Type | On-policy | Off-policy | Off-policy | Off-policy |
-| Action Space | Any | Discrete | Continuous | Continuous |
+| Action Space | Continuous | Discrete | Continuous | Continuous |
 | Sample Efficiency | Low | High | High | High |
 | Stability | High | Medium | High | High |
 | Implementation Complexity | Medium | Low | High | Medium |
 | Hyperparameter Sensitivity | Low | Medium | High | Medium |
 
 **When to choose PPO**:
-- Discrete or continuous action spaces
+- Continuous action spaces with bounded (normalized) actions
 - On-policy learning is acceptable
 - Simplicity and robustness are prioritized over sample efficiency
 - Reproducibility and ease of tuning are important
